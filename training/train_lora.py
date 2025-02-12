@@ -1,6 +1,7 @@
 # Core Python libraries
 import os  # File and path operations
 import torch  # Main PyTorch library for tensor operations and neural networks
+import argparse
 
 # PyTorch data handling and processing
 from torch.utils.data import (
@@ -141,7 +142,9 @@ def train_lora(
     unet = get_peft_model(unet, lora_config)  # Wraps model with LoRA layers
 
     # Create dataset without mock data
-    dataset = PersonDataset(image_dir=image_dir, instance_prompt=instance_prompt, tokenizer=tokenizer)
+    dataset = PersonDataset(
+        image_dir=image_dir, instance_prompt=instance_prompt, tokenizer=tokenizer
+    )
     val_size = int(len(dataset) * validation_split)  # Calculate validation set size
     train_size = len(dataset) - val_size  # Remaining data for training
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
@@ -343,11 +346,67 @@ def train_lora(
         return start_epoch, best_val_loss
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train a LoRA model for Stable Diffusion fine-tuning"
+    )
+    parser.add_argument(
+        "--image_dir",
+        type=str,
+        required=True,
+        help="Path to directory containing training images",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        required=True,
+        help="Path to save model checkpoints and final weights",
+    )
+    parser.add_argument(
+        "--base_model",
+        type=str,
+        default="runwayml/stable-diffusion-v1-5",
+        help="Base model to fine-tune",
+    )
+    parser.add_argument(
+        "--instance_prompt",
+        type=str,
+        default="photo of sks person",
+        help="Text prompt for training",
+    )
+    parser.add_argument("--batch_size", type=int, default=1, help="Images per batch")
+    parser.add_argument(
+        "--num_epochs", type=int, default=100, help="Number of training epochs"
+    )
+    parser.add_argument(
+        "--learning_rate", type=float, default=1e-4, help="Learning rate for training"
+    )
+    parser.add_argument(
+        "--rank", type=int, default=4, help="Rank of LoRA update matrices"
+    )
+    parser.add_argument(
+        "--validation_split",
+        type=float,
+        default=0.1,
+        help="Fraction of data to use for validation",
+    )
+    parser.add_argument(
+        "--checkpoint_freq", type=int, default=10, help="Save checkpoint every N epochs"
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    # Example usage of the training function
+    args = parse_args()
     train_lora(
-        image_dir="path/to/person/images",  # Directory with training images
-        output_dir="path/to/save/model",  # Where to save model files
-        instance_prompt="photo of sks person",  # Text prompt for training
-        num_epochs=100,  # Number of training epochs
+        image_dir=args.image_dir,
+        output_dir=args.output_dir,
+        instance_prompt=args.instance_prompt,
+        batch_size=args.batch_size,
+        num_epochs=args.num_epochs,
+        learning_rate=args.learning_rate,
+        rank=args.rank,
+        model_id=args.base_model,
+        validation_split=args.validation_split,
+        checkpoint_freq=args.checkpoint_freq,
     )

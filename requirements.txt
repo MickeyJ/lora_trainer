@@ -1,8 +1,18 @@
+# Core ML libraries
 torch>=2.0.0
+torchvision>=0.15.0
+
+# Diffusion model components
+diffusers>=0.18.0
 transformers>=4.30.0
-datasets>=2.12.0
-peft>=0.4.0
 accelerate>=0.20.0
+peft>=0.4.0
+
+# Memory optimization
 bitsandbytes>=0.40.0
-tqdm>=4.65.0
-wandb>=0.15.0 
+
+# Image processing
+Pillow>=9.5.0
+
+# Progress bars and utilities
+tqdm>=4.65.0 
