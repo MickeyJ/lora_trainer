@@ -100,6 +100,26 @@ class PersonDataset(Dataset):
         }
 
 
+def resume_from_checkpoint(checkpoint_path, unet, optimizer):
+    """Load training state from a checkpoint file
+
+    Args:
+        checkpoint_path: Path to the checkpoint file to load
+        unet: The UNet model to load weights into
+        optimizer: The optimizer to load state into
+
+    Returns:
+        start_epoch: Epoch number to resume from
+        best_val_loss: Best validation loss achieved before checkpoint
+    """
+    checkpoint = torch.load(checkpoint_path)
+    unet.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    start_epoch = checkpoint["epoch"] + 1
+    best_val_loss = checkpoint["best_val_loss"]
+    return start_epoch, best_val_loss
+
+
 def train_lora(
     image_dir: str = None,  # Path to directory containing training images
     output_dir: str = None,  # Path to save model checkpoints and final weights
@@ -326,32 +346,13 @@ def train_lora(
             # Save checkpoint to disk
             torch.save(checkpoint, os.path.join(output_dir, f"checkpoint-{epoch+1}.pt"))
 
-    def resume_from_checkpoint(checkpoint_path):
-        """Load training state from a checkpoint file
-
-        Args:
-            checkpoint_path: Path to the checkpoint file to load
-
-        Returns:
-            start_epoch: Epoch number to resume from
-            best_val_loss: Best validation loss achieved before checkpoint
-        """
-        checkpoint = torch.load(checkpoint_path)  # Load checkpoint data
-        unet.load_state_dict(checkpoint["model_state_dict"])  # Restore model weights
-        optimizer.load_state_dict(
-            checkpoint["optimizer_state_dict"]
-        )  # Restore optimizer state
-        start_epoch = checkpoint["epoch"] + 1  # Resume from next epoch
-        best_val_loss = checkpoint["best_val_loss"]  # Restore best validation loss
-        return start_epoch, best_val_loss
-
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Train a LoRA model for Stable Diffusion fine-tuning"
     )
     parser.add_argument(
-        "--image_dir",
+        "--dataset",
         type=str,
         required=True,
         help="Path to directory containing training images",
@@ -399,7 +400,7 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     train_lora(
-        image_dir=args.image_dir,
+        image_dir=args.dataset,
         output_dir=args.output_dir,
         instance_prompt=args.instance_prompt,
         batch_size=args.batch_size,

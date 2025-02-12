@@ -6,17 +6,12 @@ import torch
 
 def setup_test_data(test_dir="test_data"):
     """Create a temporary directory with test images and prompts"""
-
-    # Create test directory if it doesn't exist
     os.makedirs(test_dir, exist_ok=True)
 
-    # Create a few test images and corresponding text files
+    # Create larger test images (512x512) to match training expectations
     for i in range(3):
-        # Create a small test image (64x64 RGB)
-        image = Image.new("RGB", (64, 64), color=f"rgb({i*50}, {i*50}, {i*50})")
+        image = Image.new("RGB", (512, 512), color=f"rgb({i*50}, {i*50}, {i*50})")
         image.save(os.path.join(test_dir, f"test_image_{i}.png"))
-
-        # Create corresponding text file
         with open(os.path.join(test_dir, f"test_image_{i}.txt"), "w") as f:
             f.write(f"test prompt for image {i}")
 
@@ -35,15 +30,13 @@ def test_train_lora():
     test_output_dir = "test_output"
 
     try:
-        # Setup test environment
         setup_test_data(test_data_dir)
 
-        # Run training with minimal parameters
         train_lora(
             image_dir=test_data_dir,
             output_dir=test_output_dir,
             instance_prompt="test person photo",
-            num_epochs=2,  # Minimal epochs for testing
+            num_epochs=2,
             batch_size=1,
             learning_rate=1e-4,
             rank=4,
@@ -51,21 +44,21 @@ def test_train_lora():
             checkpoint_freq=1,
         )
 
-        # Basic checks
+        # Verify outputs
         assert os.path.exists(test_output_dir), "Output directory was not created"
         assert os.path.exists(
             os.path.join(test_output_dir, "checkpoint-1.pt")
         ), "Checkpoint was not saved"
+        assert os.path.exists(
+            os.path.join(test_output_dir, "best_model")
+        ), "Best model was not saved"
 
         print("Test completed successfully!")
 
-    except Exception as e:
-        print(f"Test failed with error: {str(e)}")
-        raise
-
     finally:
-        # Cleanup
-        cleanup_test_data(test_data_dir)
+        # Clean up test directories
+        if os.path.exists(test_data_dir):
+            shutil.rmtree(test_data_dir)
         if os.path.exists(test_output_dir):
             shutil.rmtree(test_output_dir)
 
