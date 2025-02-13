@@ -376,7 +376,7 @@ def train_lora_sdxl(
 
 class SDXLDataset(Dataset):
     def __init__(
-        self, data_dir, tokenizer_one, tokenizer_two, size=128, cache_latents=True
+        self, data_dir, tokenizer_one, tokenizer_two, size=512, cache_latents=True
     ):
         self.data_dir = data_dir
         self.tokenizer_one = tokenizer_one
@@ -395,9 +395,18 @@ class SDXLDataset(Dataset):
         self.transforms = transforms.Compose(
             [
                 transforms.Resize(
-                    size, interpolation=transforms.InterpolationMode.BILINEAR
+                    size,
+                    interpolation=transforms.InterpolationMode.BILINEAR,
+                    maintain_aspect_ratio=True,
                 ),
-                transforms.CenterCrop(size),
+                transforms.Pad(
+                    padding=lambda x: (
+                        (0, 0, size - x.shape[-1], size - x.shape[-2])
+                        if x.shape[-1] != size or x.shape[-2] != size
+                        else (0, 0, 0, 0)
+                    ),
+                    fill=0,
+                ),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
             ]
