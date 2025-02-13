@@ -12,6 +12,7 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"  # Disable symlinks warning
 # Add their recommended number of CPU threads
 os.environ["OMP_NUM_THREADS"] = "8"  # They suggest 8 CPU threads
+os.environ["XFORMERS_MORE_DETAILS"] = "1"  # They suggest 8 CPU threads
 
 import torch
 import torch.nn.functional as F
@@ -22,11 +23,13 @@ from accelerate import Accelerator
 from diffusers import (
     AutoencoderKL,
     UNet2DConditionModel,
+    StableDiffusionXLPipeline,
 )
 from transformers import (
     CLIPTextModel,
     CLIPTokenizer,
     CLIPTextModelWithProjection,
+    BitsAndBytesConfig,
 )
 from peft import LoraConfig, get_peft_model
 import logging
@@ -36,6 +39,7 @@ from PIL import Image
 import torch.cuda
 import gc
 from bitsandbytes.optim import AdamW8bit
+from tqdm.auto import tqdm
 
 # Set up logging
 logging.basicConfig(
@@ -49,9 +53,10 @@ def train_lora_sdxl(
     train_data_dir: str,
     output_dir: str,
     num_epochs: int = 5,  # They recommend 5 epochs
+    image_size: int = 512,  # Add this parameter
     batch_size: int = 1,  # They suggest reducing to 1 if having memory issues
     gradient_accumulation_steps: int = 8,  # Keep our increased value
-    learning_rate: float = 3e-4,  # They use 0.0003
+    learning_rate: float = 1e-4,  # Reduced from 3e-4 to 1e-4
 ):
     """Train a LoRA adapter for SDXL"""
 
@@ -62,8 +67,8 @@ def train_lora_sdxl(
         mixed_precision="fp16",
     )
 
-    # Add gradient clipping after initialization
-    accelerator.clip_grad_norm_ = 1.0  # Enable gradient clipping
+    # Reduce max gradient norm for more stability
+    accelerator.clip_grad_norm_ = 0.5  # Changed from 1.0 to 0.5
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -81,36 +86,42 @@ def train_lora_sdxl(
     )
 
     logger.info("Loading models...")
-    # Load models without device mapping or offloading
+    # Set up quantization config
+    quantization_config = BitsAndBytesConfig(
+        load_in_8bit=True,
+        llm_int8_threshold=6.0,
+        bnb_4bit_compute_dtype=torch.float16,
+    )
+
+    # Load models with quantization config
     text_encoder_one = CLIPTextModel.from_pretrained(
         pretrained_model_path,
         subfolder="text_encoder",
-        torch_dtype=torch.float16,
-        use_safetensors=True,  # Add this to ensure proper loading
+        quantization_config=quantization_config,
+        use_safetensors=True,
+        low_cpu_mem_usage=True,
     )
     text_encoder_two = CLIPTextModelWithProjection.from_pretrained(
         pretrained_model_path,
         subfolder="text_encoder_2",
-        torch_dtype=torch.float16,
+        quantization_config=quantization_config,
+        low_cpu_mem_usage=True,
     )
-    # Load VAE in bfloat16 instead of float32
+    # Keep VAE in bfloat16 since it's sensitive to precision
     vae = AutoencoderKL.from_pretrained(
         pretrained_model_path,
         subfolder="vae",
-        torch_dtype=torch.bfloat16,  # Changed from float32
+        torch_dtype=torch.bfloat16,
     )
     unet = UNet2DConditionModel.from_pretrained(
         pretrained_model_path,
         subfolder="unet",
-        torch_dtype=torch.float16,
+        quantization_config=quantization_config,
+        low_cpu_mem_usage=True,
     )
 
-    # Let accelerator handle all models except VAE
-    unet, text_encoder_one, text_encoder_two = accelerator.prepare(
-        unet, text_encoder_one, text_encoder_two
-    )
-    # Handle VAE separately
-    vae = vae.to(accelerator.device)
+    # Only prepare non-8bit models with accelerator
+    vae = accelerator.prepare(vae)
 
     # Enable memory efficient attention
     if hasattr(unet.config, "use_memory_efficient_attention") and hasattr(
@@ -125,7 +136,7 @@ def train_lora_sdxl(
     text_encoder_two.requires_grad_(False)
 
     # After loading UNet but before applying LoRA
-    unet.config.sample_size = 32  # Change back to 32 from 16
+    unet.config.sample_size = 16  # Change back to 32 from 16
 
     # After loading UNet
     try:
@@ -133,8 +144,14 @@ def train_lora_sdxl(
 
         unet.enable_xformers_memory_efficient_attention()
         logger.info("Enabled xformers memory efficient attention")
-    except ImportError:
-        logger.info("xformers not available")
+    except (ImportError, Exception) as e:
+        logger.warning(f"xformers not available: {e}")
+        logger.info("Falling back to default memory efficient attention")
+        # Enable memory efficient attention without xformers
+        if hasattr(unet.config, "use_memory_efficient_attention"):
+            unet.config.use_memory_efficient_attention = True
+            unet.config.use_sdpa = True
+            logger.info("Enabled default memory efficient attention")
 
     logger.info("Models loaded successfully")
 
@@ -163,7 +180,7 @@ def train_lora_sdxl(
         train_data_dir,
         tokenizer_one,
         tokenizer_two,
-        size=128,  # Reduced from 512
+        size=image_size,
         cache_latents=True,
     )
 
@@ -230,6 +247,9 @@ def train_lora_sdxl(
         return torch.cat(all_latents)
 
     for epoch in range(num_epochs):
+        progress_bar = tqdm(
+            total=len(train_dataloader), desc=f"Epoch {epoch+1}/{num_epochs}"
+        )
         total_loss = 0
         num_steps = 0
         logger.info(f"\nStarting epoch {epoch+1}/{num_epochs}")
@@ -319,6 +339,8 @@ def train_lora_sdxl(
                     f"| Avg Loss: {avg_loss:.4f}"
                 )
 
+            progress_bar.update(1)
+
         # End of epoch logging
         avg_epoch_loss = total_loss / num_steps if num_steps > 0 else 0
         logger.info(f"Epoch {epoch+1} completed | Average Loss: {avg_epoch_loss:.4f}")
@@ -327,6 +349,27 @@ def train_lora_sdxl(
     if os.path.exists("offload"):
         shutil.rmtree("offload")
     logger.info("Cleaned up temporary files")
+
+    # After training loop completes, before "Training complete!"
+    # Save the LoRA weights
+    logger.info("Saving LoRA weights...")
+    unet.save_pretrained(output_dir)
+
+    # Save the config file
+    lora_config.save_pretrained(output_dir)
+
+    # Optional: Save a model card with training details
+    with open(os.path.join(output_dir, "README.md"), "w") as f:
+        f.write(
+            f"""
+# SDXL LoRA Model
+- Base model: {pretrained_model_path}
+- Training epochs: {num_epochs}
+- Learning rate: {learning_rate}
+- Batch size: {batch_size}
+- Gradient accumulation steps: {gradient_accumulation_steps}
+        """
+        )
 
     logger.info("Training complete!")
 
