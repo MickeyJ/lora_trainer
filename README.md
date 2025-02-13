@@ -94,3 +94,9 @@ python test_train_lora.py
 # Test SDXL training
 python test_train_lora_sdxl.py
 ```
+
+## Model Download
+
+The script will automatically download the SDXL base model (~12GB) from Hugging Face on first run. Make sure you have:
+- At least 20GB of free disk space
+- A stable internet connection for the initial download

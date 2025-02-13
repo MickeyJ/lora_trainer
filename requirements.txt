@@ -18,4 +18,8 @@ bitsandbytes-windows>=0.37.5
 Pillow>=9.5.0
 
 # Progress bars and utilities
-tqdm>=4.65.0 
+tqdm>=4.65.0
+
+# Added from the code block
+xformers
+bitsandbytes>=0.35.0 
