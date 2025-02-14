@@ -1,12 +1,11 @@
 import os
 import shutil
 
-# More aggressive CUDA memory settings
+# More conservative CUDA memory settings
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
-    "max_split_size_mb:32,"  # Keep our existing setting
-    "expandable_segments:True,"  # Allow memory segments to expand
-    "garbage_collection_threshold:0.6,"  # More aggressive than before
-    "roundup_power2:True"  # Might help with fragmentation
+    "max_split_size_mb:21,"  # Minimum value that works
+    "expandable_segments:True,"
+    "garbage_collection_threshold:0.6"
 )
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"  # Disable symlinks warning
@@ -40,6 +39,7 @@ import torch.cuda
 import gc
 from bitsandbytes.optim import AdamW8bit
 from tqdm.auto import tqdm
+from diffusers.models.attention_processor import XFormersAttnProcessor
 
 # Set up logging
 logging.basicConfig(
@@ -49,9 +49,9 @@ logger = logging.getLogger(__name__)
 
 
 def train_lora_sdxl(
-    pretrained_model_path: str,
     train_data_dir: str,
     output_dir: str,
+    pretrained_model_path: str = "stabilityai/stable-diffusion-xl-base-1.0",
     num_epochs: int = 5,  # They recommend 5 epochs
     image_size: int = 512,  # Add this parameter
     batch_size: int = 1,  # They suggest reducing to 1 if having memory issues
@@ -136,22 +136,64 @@ def train_lora_sdxl(
     text_encoder_two.requires_grad_(False)
 
     # After loading UNet but before applying LoRA
-    unet.config.sample_size = 16  # Change back to 32 from 16
+    unet.config.sample_size = 32  # Change back to 32 from 16
+
+    # After loading VAE
+    vae = vae.to("cpu")  # Keep VAE in CPU
 
     # After loading UNet
     try:
         import xformers
 
-        unet.enable_xformers_memory_efficient_attention()
-        logger.info("Enabled xformers memory efficient attention")
+        class CustomAttnProcessor(XFormersAttnProcessor):
+            def __call__(
+                self,
+                attn,
+                hidden_states,
+                encoder_hidden_states=None,
+                attention_mask=None,
+            ):
+                batch_size, sequence_length, _ = hidden_states.shape
+                attention_mask = attn.prepare_attention_mask(
+                    attention_mask, sequence_length, batch_size
+                )
+
+                query = attn.to_q(hidden_states)
+                key = attn.to_k(
+                    encoder_hidden_states
+                    if encoder_hidden_states is not None
+                    else hidden_states
+                )
+                value = attn.to_v(
+                    encoder_hidden_states
+                    if encoder_hidden_states is not None
+                    else hidden_states
+                )
+
+                # Convert all to same dtype
+                dtype = torch.float16
+                query = query.to(dtype)
+                key = key.to(dtype)
+                value = value.to(dtype)
+
+                hidden_states = xformers.ops.memory_efficient_attention(
+                    query, key, value, attention_mask
+                )
+                # Apply the output projections and return a single tensor
+                hidden_states = attn.to_out[0](hidden_states)
+                hidden_states = attn.to_out[1](hidden_states)
+                return hidden_states
+
+        unet.set_attn_processor(CustomAttnProcessor())
+        logger.info(f"Successfully enabled xformers version {xformers.__version__}")
+        logger.info("Memory efficient attention active - expect 20-30% less VRAM usage")
     except (ImportError, Exception) as e:
         logger.warning(f"xformers not available: {e}")
         logger.info("Falling back to default memory efficient attention")
-        # Enable memory efficient attention without xformers
         if hasattr(unet.config, "use_memory_efficient_attention"):
             unet.config.use_memory_efficient_attention = True
             unet.config.use_sdpa = True
-            logger.info("Enabled default memory efficient attention")
+            logger.info("Using PyTorch's native memory efficient attention")
 
     logger.info("Models loaded successfully")
 
@@ -203,10 +245,12 @@ def train_lora_sdxl(
         unet, optimizer, train_dataloader
     )
 
-    # Enable gradient checkpointing
+    # Enable gradient checkpointing with custom config
     unet.enable_gradient_checkpointing()
-    text_encoder_one._set_gradient_checkpointing(True)
-    text_encoder_two._set_gradient_checkpointing(True)
+    unet.gradient_checkpointing_kwargs = {
+        "use_reentrant": False,  # More memory efficient
+        "checkpoint_rng_state": False,  # Skip RNG state checkpointing
+    }
 
     # Get weight dtype for reference only
     weight_dtype = torch.float32
@@ -229,24 +273,37 @@ def train_lora_sdxl(
             torch.cuda.ipc_collect()
             if hasattr(torch.cuda, "memory_stats"):
                 torch.cuda.reset_peak_memory_stats()
+            # Force garbage collection
             gc.collect()
+            # Clear gradient checkpoints
+            if hasattr(torch, "clear_checkpoints"):
+                torch.clear_checkpoints()
 
     # Split VAE encoding into chunks
     def encode_images_in_chunks(images, chunk_size=1):
         all_latents = []
         for i in range(0, images.shape[0], chunk_size):
             chunk = images[i : i + chunk_size]
-            with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
-                chunk_latents = vae.encode(
-                    chunk.to(accelerator.device, dtype=torch.bfloat16)
-                ).latent_dist.sample()
-                chunk_latents = chunk_latents * 0.18215
+            # Move chunk to CPU, encode, then move back
+            with torch.no_grad():
+                chunk_cpu = chunk.to("cpu")
+                chunk_latents = vae.encode(chunk_cpu).latent_dist.sample()
+                chunk_latents = chunk_latents.to(accelerator.device) * 0.18215
             all_latents.append(chunk_latents)
-            del chunk
+            del chunk, chunk_latents, chunk_cpu
             cleanup()
         return torch.cat(all_latents)
 
+    def log_memory_usage():
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024**2
+            reserved = torch.cuda.memory_reserved() / 1024**2
+            logger.info(
+                f"GPU Memory: {allocated:.2f}MB allocated, {reserved:.2f}MB reserved"
+            )
+
     for epoch in range(num_epochs):
+        cleanup()  # Clean before each epoch
         progress_bar = tqdm(
             total=len(train_dataloader), desc=f"Epoch {epoch+1}/{num_epochs}"
         )
@@ -256,24 +313,33 @@ def train_lora_sdxl(
 
         unet.train()
         for step, batch in enumerate(train_dataloader):
-            # Process in smaller chunks
-            with accelerator.accumulate(unet):  # This helps with memory
+            cleanup()  # Clean before each batch
+            with accelerator.accumulate(unet):
                 with torch.cuda.amp.autocast():
                     # Process VAE in chunks
                     latents = encode_images_in_chunks(batch["pixel_values"])
                     del batch["pixel_values"]
                     cleanup()
 
-                    # Get the text embeddings
+                    # Get noise - ensure same device as latents
+                    noise = torch.randn_like(latents)
+                    timesteps = torch.randint(
+                        0, 1000, (latents.shape[0],), device=latents.device
+                    )
+                    noisy_latents = (
+                        noise
+                        + timesteps.reshape(-1, 1, 1, 1).to(latents.device) * latents
+                    )
+                    del latents
+                    cleanup()
+
+                    # Get text embeddings
                     with torch.no_grad():
-                        # Get full hidden states
                         text_outputs = text_encoder_one(
                             batch["input_ids_one"].to(accelerator.device),
                             output_hidden_states=True,
                         )
-                        prompt_embeds = text_outputs.hidden_states[
-                            -1
-                        ]  # Use full hidden states
+                        prompt_embeds = text_outputs.hidden_states[-1]
 
                         # Project to correct dimension if needed
                         if prompt_embeds.shape[-1] != 2048:
@@ -281,37 +347,36 @@ def train_lora_sdxl(
                                 prompt_embeds, (0, 2048 - prompt_embeds.shape[-1])
                             )
 
+                        del text_outputs
+                        cleanup()
+
                         pooled_prompt_embeds = text_encoder_two(
                             batch["input_ids_two"].to(accelerator.device)
                         ).text_embeds
-                        logger.debug(
-                            f"Pooled embeds shape: {pooled_prompt_embeds.shape}"
-                        )
 
-                    # Add dimension checks
-                    # logger.info(f"Prompt embeds shape: {prompt_embeds.shape}")
-                    # logger.info(f"Pooled embeds shape: {pooled_prompt_embeds.shape}")
-                    # logger.info(f"Latents shape: {latents.shape}")
+                        # Ensure correct shape
+                        if pooled_prompt_embeds.shape[-1] != 1280:
+                            pooled_prompt_embeds = torch.nn.functional.pad(
+                                pooled_prompt_embeds,
+                                (0, 1280 - pooled_prompt_embeds.shape[-1]),
+                            )
 
-                    # Training step
-                    noise = torch.randn_like(latents)
-                    timesteps = torch.randint(
-                        0, 1000, (latents.shape[0],), device=latents.device
-                    )
-                    noisy_latents = noise + timesteps.reshape(-1, 1, 1, 1) * latents
+                        cleanup()
 
-                    # Predict noise
+                    # Forward pass
                     noise_pred = unet(
                         noisy_latents,
                         timesteps,
                         prompt_embeds,
                         added_cond_kwargs={
                             "text_embeds": pooled_prompt_embeds,
-                            "time_ids": torch.zeros((batch_size, 6)).to(
-                                accelerator.device
+                            "time_ids": torch.zeros(
+                                (batch_size, 6), device=accelerator.device
                             ),
                         },
                     ).sample
+                    del noisy_latents, prompt_embeds, pooled_prompt_embeds
+                    cleanup()
 
                     loss = F.mse_loss(noise_pred, noise, reduction="mean")
                     total_loss += loss.item()
@@ -321,11 +386,7 @@ def train_lora_sdxl(
                     accelerator.backward(loss)
                     optimizer.step()
                     optimizer.zero_grad()
-
-                # Free memory more aggressively
-                del noise_pred
-                del noise
-                torch.cuda.empty_cache()
+                    cleanup()  # Clean after optimization
 
             if step % 2 == 0:  # More frequent cleanup
                 cleanup()
@@ -340,6 +401,9 @@ def train_lora_sdxl(
                 )
 
             progress_bar.update(1)
+
+            # Add to training loop at key points
+            log_memory_usage()
 
         # End of epoch logging
         avg_epoch_loss = total_loss / num_steps if num_steps > 0 else 0
@@ -383,6 +447,10 @@ class SDXLDataset(Dataset):
         self.tokenizer_two = tokenizer_two
         self.cache_latents = cache_latents
         self.cached_latents = {}
+        self.text_embeddings_cache = {}
+        # Move text encoders to CPU
+        self.text_encoder_one = text_encoder_one.to("cpu")
+        self.text_encoder_two = text_encoder_two.to("cpu")
 
         # Get image paths
         self.image_paths = [
@@ -394,23 +462,33 @@ class SDXLDataset(Dataset):
         # Image transforms
         self.transforms = transforms.Compose(
             [
+                # First resize the smaller edge to target size while maintaining aspect ratio
                 transforms.Resize(
-                    size,
-                    interpolation=transforms.InterpolationMode.BILINEAR,
-                    maintain_aspect_ratio=True,
+                    size, interpolation=transforms.InterpolationMode.BILINEAR
                 ),
-                transforms.Pad(
-                    padding=lambda x: (
-                        (0, 0, size - x.shape[-1], size - x.shape[-2])
-                        if x.shape[-1] != size or x.shape[-2] != size
-                        else (0, 0, 0, 0)
-                    ),
-                    fill=0,
+                # Then pad to square with a fixed padding function
+                transforms.Lambda(
+                    lambda x: transforms.functional.pad(
+                        x,
+                        padding=[
+                            0,  # left
+                            0,  # top
+                            max(0, size - x.size[-1]),  # right
+                            max(0, size - x.size[-2]),  # bottom
+                        ],
+                        fill=0,
+                    )
                 ),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
             ]
         )
+
+        # Clear any existing cached data
+        if hasattr(self, "cached_latents"):
+            del self.cached_latents
+        self.cached_latents = {}
+        torch.cuda.empty_cache()
 
     def __len__(self):
         return len(self.image_paths)
@@ -418,9 +496,18 @@ class SDXLDataset(Dataset):
     def __getitem__(self, idx):
         image_path = self.image_paths[idx]
 
-        # Load image
-        image = Image.open(image_path).convert("RGB")
-        image = self.transforms(image)
+        # Clear cache periodically
+        if idx % 4 == 0 and hasattr(self, "cached_latents"):
+            self.cached_latents.clear()
+            torch.cuda.empty_cache()
+
+        # Load and process image
+        try:
+            image = Image.open(image_path).convert("RGB")
+            image = self.transforms(image)
+        except Exception as e:
+            logger.error(f"Error loading image {image_path}: {e}")
+            raise
 
         # Get prompt from .txt file or use default
         prompt_path = os.path.splitext(image_path)[0] + ".txt"
@@ -451,6 +538,45 @@ class SDXLDataset(Dataset):
             "input_ids_one": tokenized_one.input_ids[0],
             "input_ids_two": tokenized_two.input_ids[0],
         }
+
+    def get_text_embeddings(self, prompt):
+        if prompt in self.text_embeddings_cache:
+            return self.text_embeddings_cache[prompt]
+
+        # Process on CPU
+        with torch.no_grad():
+            text_inputs_one = self.tokenizer_one(
+                prompt,
+                padding="max_length",
+                max_length=self.tokenizer_one.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            ).to("cpu")
+
+            text_inputs_two = self.tokenizer_two(
+                prompt,
+                padding="max_length",
+                max_length=self.tokenizer_two.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            ).to("cpu")
+
+            prompt_embeds = self.text_encoder_one(
+                text_inputs_one.input_ids,
+                output_hidden_states=True,
+            ).hidden_states[-1]
+
+            pooled_prompt_embeds = self.text_encoder_two(
+                text_inputs_two.input_ids
+            ).text_embeds
+
+            # Cache results
+            self.text_embeddings_cache[prompt] = {
+                "prompt_embeds": prompt_embeds.to(accelerator.device),
+                "pooled_prompt_embeds": pooled_prompt_embeds.to(accelerator.device),
+            }
+
+        return self.text_embeddings_cache[prompt]
 
 
 if __name__ == "__main__":

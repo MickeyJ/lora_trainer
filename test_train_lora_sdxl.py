@@ -2,43 +2,55 @@ import os
 import shutil
 from PIL import Image
 import torch
+import tempfile
+import numpy as np
 
 
-def setup_test_data(test_dir="test_data"):
+def setup_test_data(test_dir="test_data", use_random_images=False, image_count=10):
     """Create a temporary directory with test images and prompts"""
     os.makedirs(test_dir, exist_ok=True)
 
-    # Create test images at SDXL resolution (1024x1024)
-    for i in range(3):
-        image = Image.new("RGB", (512, 512), color=f"rgb({i*50}, {i*50}, {i*50})")
-        image.save(os.path.join(test_dir, f"test_image_{i}.png"))
-        with open(os.path.join(test_dir, f"test_image_{i}.txt"), "w") as f:
-            f.write(f"test prompt for image {i}")
+    if use_random_images:
+        # Create test images to match recommended dataset size
+        for i in range(image_count):
+            img = Image.fromarray(
+                np.random.randint(0, 255, (1024, 1024, 3), dtype=np.uint8)
+            )
+            img.save(os.path.join(test_dir, f"test_image_{i}.jpg"))
+            with open(os.path.join(test_dir, f"test_image_{i}.txt"), "w") as f:
+                f.write("A photo of sks person, high quality portrait")
+    else:
+        # Use existing test images
+        if not os.path.exists("test_image_data"):
+            raise ValueError("test_image_data directory not found")
+
+
+def cleanup_test_data(test_dir="test_output"):
+    """Clean up test directories after running"""
+    if os.path.exists(test_dir):
+        shutil.rmtree(test_dir)
 
 
 def test_train_lora_sdxl():
     """Test the SDXL LoRA training pipeline"""
     from train_lora_sdxl import train_lora_sdxl
 
-    test_data_dir = "test_data"
-    test_output_dir = "test_output"
-
     try:
-        # Create test data first
-        setup_test_data(test_data_dir)
+        # Create test data that matches recommended real training
+        setup_test_data(use_random_images=True, image_count=15)  # Will create 15 test images
 
         train_lora_sdxl(
-            pretrained_model_path="stabilityai/stable-diffusion-xl-base-1.0",
-            train_data_dir=test_data_dir,
-            output_dir=test_output_dir,
+            train_data_dir="test_data",  # Use the random test images
+            output_dir="test_output",
+            num_epochs=100,  # More epochs for fewer images
+            batch_size=1,
+            image_size=512,
+            learning_rate=1e-5,  # Lower for stability
+            gradient_accumulation_steps=4,
         )
-
     finally:
-        # Clean up test directories
-        if os.path.exists(test_data_dir):
-            shutil.rmtree(test_data_dir)
-        if os.path.exists(test_output_dir):
-            shutil.rmtree(test_output_dir)
+        cleanup_test_data("test_data")  # Clean up test input
+        cleanup_test_data("test_output")  # Clean up test output
 
 
 if __name__ == "__main__":
